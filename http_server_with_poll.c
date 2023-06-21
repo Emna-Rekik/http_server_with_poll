@@ -6,45 +6,38 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
 
-#define PORT 8080
-#define MAX_CLIENTS 10
-#define BUFFER_SIZE 1024
-#define HTML_FILE "index.html"
+#include "http_parser/http_parser.h"
+#include "index_html_gz.h"
+#include "config.h"
+
+static char url_buffer[MAX_URL_LENGTH];
+static char buffer[BUFFER_SIZE] = {0};
+static char http_response[BUFFER_SIZE];
+static struct pollfd fds[MAX_CLIENTS+1];
+
+static int on_url(http_parser* parser, const char* at, size_t length) {
+    // Copy the URL string to the buffer
+    strncpy(url_buffer, at, length);
+    url_buffer[length] = '\0';
+    printf("Requested URL: %s\n", url_buffer);
+
+    return 0;
+}
 
 int main() {
     int server_fd, new_socket;
     struct sockaddr_in address;
     int addrlen = sizeof(address);
-    char buffer[BUFFER_SIZE] = {0};
-
-    // Read the HTML file
-    int html_fd = open(HTML_FILE, O_RDONLY);
-    struct stat html_stat;
-    fstat(html_fd, &html_stat);
-    size_t html_size = html_stat.st_size;
-    char *html_data = malloc(html_size + 1);
-    read(html_fd, html_data, html_size);
-    html_data[html_size] = '\0';
-    close(html_fd);
-
-    // Send the HTTP response headers with Content-Length
-    char http_response[BUFFER_SIZE];
-    sprintf(http_response, "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html\r\n"
-                "Content-Length: %zu\r\n\r\n",
-        html_size);
 
     // Create a socket
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+    if ((server_fd = socket(SOCKET_FAMILY, SOCK_STREAM, 0)) == 0) {
         perror("socket failed");
         exit(EXIT_FAILURE);
     }
 
     // Set up server address and port
-    address.sin_family = AF_INET;
+    address.sin_family = SOCKET_FAMILY;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
 
@@ -61,7 +54,6 @@ int main() {
     }
 
     // Initialize an array of pollfd structures for polling events
-    struct pollfd fds[MAX_CLIENTS];
     memset(fds, 0, sizeof(fds));
     fds[0].fd = server_fd;
     fds[0].events = POLLIN;
@@ -94,19 +86,59 @@ int main() {
                         }
                     }
                 } else {
-                    
-                    // Clear the buffer
-                    memset(buffer, 0, BUFFER_SIZE);
-                    
-                    // Read any remaining data from the client
+                    // Create an instance of the http_parser
+                    http_parser_settings parserSettings;
+                    http_parser parser;
+                    http_parser_init(&parser, HTTP_REQUEST);
+                    http_parser_settings_init(&parserSettings);
+                    parserSettings.on_url = on_url;
+
+                    // Read the data from the client
                     int valread = read(fds[i].fd, buffer, BUFFER_SIZE);
-                    if (valread > 0) {
-                        // Send the HTTP response headers
-                        send(fds[i].fd, http_response, strlen(http_response), 0);
+                    if (valread < 0) {
+                         perror("read failed");
+                         exit(EXIT_FAILURE);
                     }
-                    
-                    // Send the HTML content to the client
-                    send(fds[i].fd, html_data, html_size, 0);
+
+                    // Parse the HTTP request using the http_parser
+                    size_t bytesRead = strlen(buffer);
+                    http_parser_execute(&parser, &parserSettings, buffer, bytesRead);
+
+                    if (strcmp(url_buffer, "/") == 0) {
+                        // Send the HTTP response headers with Content-Length
+                        sprintf(http_response, "HTTP/1.1 200 OK\r\n"
+                                                "Content-Type: text/html\r\n"
+                                                "Content-Encoding: gzip\r\n"
+                                                "Content-Length: %u\r\n\r\n",
+                                index_html_gz_len);
+                        if (send(fds[i].fd, http_response, strlen(http_response), 0) < 0) {
+                            perror("send failed");
+                            exit(EXIT_FAILURE);
+                        }
+
+                        // Send the compressed HTML content in chunks
+                        size_t bytes_sent = 0;
+                        while (bytes_sent < index_html_gz_len) {
+                            size_t chunk_size = BUFFER_SIZE;
+                            if (index_html_gz_len - bytes_sent < chunk_size) {
+                                chunk_size = index_html_gz_len - bytes_sent;
+                            }
+                            if (send(fds[i].fd, index_html_gz + bytes_sent, chunk_size, 0) < 0) {
+                                perror("send failed");
+                                exit(EXIT_FAILURE);
+                            }
+                            bytes_sent += chunk_size;
+                        }
+                    } else {
+                        // Resource not found, send a 404 response
+                        const char* not_found_response = "HTTP/1.1 404 Not Found\r\n"
+                                                         "Content-Length: 9\r\n\r\n"
+                                                         "Not Found";
+                        if (send(fds[i].fd, not_found_response, strlen(not_found_response), 0) < 0) {
+                            perror("send failed");
+                            exit(EXIT_FAILURE);
+                        }
+                    }
 
                     // Close the client socket and clear its entry in the fds array
                     close(fds[i].fd);
@@ -116,6 +148,5 @@ int main() {
         }
     }
 
-    free(html_data); // Free the HTML data
     return 0;
 }
